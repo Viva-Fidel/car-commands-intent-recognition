@@ -1,17 +1,17 @@
 import logging
+import pyaudio
 import tensorflow as tf
-import telegram.ext.filters as filters
-
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CallbackContext, CommandHandler, MessageHandler
+import json
+import wave
 
 from transformers import BertTokenizer, TFBertForSequenceClassification
 
-from speech import Speech_Recognition
+from vosk import KaldiRecognizer, Model
 
-speech_recognition = Speech_Recognition()
 tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
 loaded_model = TFBertForSequenceClassification.from_pretrained('saved_model')
+
+model = Model('models/vosk-model-small-ru-0.22')
 
 prediction_classes = {0: "включение_дворников",
                    1: "включение_кондиционера",
@@ -32,42 +32,73 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Вывод сообщения при выборе команды /start
-async def start(update: Update, context: CallbackContext):
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text="Привет, отправь аудиосообщение, чтобы управлять авто. Бот понимает команды, которые связаны с: поиском маршрута, открытием/закрытием дверей, включением/выключением радио, кондиционера, дворников и управлением температуры в салоне. Для того, чтобы увидеть примеры команд набери /help")
+# Записываем аудио с микрофона
+def record_audio(duration, file_path):
 
-# Вывод сообщения при выборе команды /help
-async def help(update: Update, context: CallbackContext):
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text="Нужно всего лишь отправить аудиосообщение. Пример аудио сообщений: проложи маршрут домой, повысь температуру кондиционера, закрой переднюю дверь, включи радио")
+    print("Начните говорить")
 
-# Получение и обработка аудио
-async def handle_voice_message(update: Update, context: CallbackContext):
-    audio_file = await context.bot.get_file(update.message.voice.file_id)
+    chunk_size = 1024
+    sample_format = pyaudio.paInt16
+    channels = 1
+    sample_rate = 44100
 
-    # Скачивание аудиофайла
-    local_path = await audio_file.download_to_drive()
-    logging.info(f"Audio file saved to {local_path}")
+    p = pyaudio.PyAudio()
+
+    stream = p.open(format=sample_format,
+                    channels=channels,
+                    rate=sample_rate,
+                    frames_per_buffer=chunk_size,
+                    input=True)
+
+    frames = []
+
+    for i in range(0, int(sample_rate / chunk_size * duration)):
+        data = stream.read(chunk_size)
+        frames.append(data)
+
+    stream.stop_stream()
+    stream.close()
+
+    p.terminate()
+
+    # Сохраняем аудио в wav
+    wf = wave.open(file_path, 'wb')
+    wf.setnchannels(channels)
+    wf.setsampwidth(p.get_sample_size(sample_format))
+    wf.setframerate(sample_rate)
+    wf.writeframes(b''.join(frames))
+    wf.close()
 
     # Попытка конвертации аудио в текст и вывод сообщения пользователю
     try:
-        text = await transform_audio_to_text(local_path)
-        intent = await classify_intent(text)
-        await update.message.reply_text(f"Ваше сообщение: {text}")
-        await update.message.reply_text(f"Выполняемое действие: {intent}")
+        text = transform_audio_to_text(file_path)
+        intent = classify_intent(text)
+        return (f"Ваше сообщение: {text}, Выполняемое действие: {intent}")
     except Exception as e:
         logging.error(f"Failed to transcribe audio: {e}")
-        await update.message.reply_text("Вас плохо слышно, отправьте аудисообщение заново")
+        return("Вас плохо слышно, отправьте аудисообщение заново")
+
 
 # Конвертации аудио в текст
-async def transform_audio_to_text(local_path):
-    logging.info(f"Transcribing audio file at {local_path}")
-    text = speech_recognition.audio_to_text(local_path)
-    return text
+def transform_audio_to_text(local_path):
+
+    with wave.open(local_path, 'rb') as wav_file:
+        sample_rate = wav_file.getframerate()
+        recognizer = KaldiRecognizer(model, sample_rate)
+
+        while True:
+            data = wav_file.readframes(4000)
+            if len(data) == 0:
+                break
+
+            if recognizer.AcceptWaveform(data):
+                result = json.loads(recognizer.Result())
+                text = result['text']
+                return text
+
 
 # Получаем намерение
-async def classify_intent(text):
+def classify_intent(text):
     input_encoding = tokenizer.encode_plus(text, truncation=True, padding=True, return_tensors="tf")
     logits = loaded_model(input_encoding['input_ids'], input_encoding['attention_mask'])[0]
     probabilities = tf.nn.softmax(logits, axis=-1)
@@ -81,14 +112,5 @@ async def classify_intent(text):
         return "Система не смогла опознать команду, отправьте аудиосообщение ещё раз"
 
 
-if __name__ == '__main__':
-    application = ApplicationBuilder().token('').build()  # Insert your bot token here
-
-    start_handler = CommandHandler('start', start)
-    help_handler = CommandHandler('help', help)
-    application.add_handler(start_handler)
-    application.add_handler(help_handler)
-
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
-    application.run_polling()
-
+audio_results = record_audio(5, 'my_audio.wav')
+print(audio_results)
